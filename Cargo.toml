@@ -1,0 +1,10 @@
+[package]
+name = "aligators"
+authors = ["Mihnea Buzatu <mihnbuz@gmail.com>"]
+description = "A collection of assorted allocators"
+license = "MIT"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libc = "1.0.0-alpha.5"
