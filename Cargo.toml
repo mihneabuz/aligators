@@ -8,3 +8,7 @@ edition = "2024"
 
 [dependencies]
 libc = "1.0.0-alpha.5"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

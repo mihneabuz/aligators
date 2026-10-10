@@ -31,19 +31,6 @@ impl<'a> BufferAllocator<'a> {
         Some(unsafe { NonNull::slice_from_raw_parts(base.byte_add(offset), len - offset) })
     }
 
-    fn zero(&self, ptr: NonNull<[u8]>, start: usize) {
-        if start > ptr.len() {
-            return;
-        }
-
-        // SAFETY: `start` is within bounds of `ptr`
-        unsafe {
-            ptr.cast::<u8>()
-                .add(start)
-                .write_bytes(0, ptr.len() - start);
-        }
-    }
-
     fn alloc(&self, layout: Layout, zero: bool) -> Result<NonNull<[u8]>, AllocError> {
         if layout.size() == 0 {
             return Ok(NonNull::slice_from_raw_parts(layout.dangling_ptr(), 0));
@@ -58,7 +45,10 @@ impl<'a> BufferAllocator<'a> {
         self.used.set(true);
 
         if zero {
-            self.zero(aligned, 0);
+            // SAFETY: `aligned` is a valid slice of the buffer
+            unsafe {
+                aligned.cast::<u8>().write_bytes(0, aligned.len());
+            }
         }
 
         Ok(aligned)
@@ -107,13 +97,18 @@ impl<'a> BufferAllocator<'a> {
                     ptr.as_ptr(),
                     block.cast::<u8>().as_ptr(),
                     old.size().min(new.size()),
-                )
+                );
             };
             block
         };
 
         if zero && block.len() > old.size() {
-            self.zero(block, old.size());
+            // SAFETY: `old.size()..block.len()` is a valid slice of `block`
+            unsafe {
+                ptr.cast::<u8>()
+                    .add(old.size())
+                    .write_bytes(0, block.len() - old.size());
+            }
         }
 
         Ok(block)
@@ -179,7 +174,7 @@ mod tests {
     }
 
     fn check_block(block: NonNull<[u8]>, layout: Layout, buffer: &Range<*const u8>) {
-        let start = block.cast::<u8>().as_ptr() as *const u8;
+        let start = block.cast::<u8>().as_ptr().cast_const();
 
         assert!(block.len() >= layout.size());
         assert!(start.addr().is_multiple_of(layout.align()));

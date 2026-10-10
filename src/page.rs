@@ -4,10 +4,14 @@ use std::{
     sync::OnceLock,
 };
 
+fn get_page_size() -> usize {
+    // SAFETY: sysconf is available on any Linux and has no preconditions
+    unsafe { usize::try_from(libc::sysconf(libc::_SC_PAGESIZE)).expect("Failed to get page size") }
+}
+
 fn page_size() -> usize {
     static PAGE_SIZE: OnceLock<usize> = OnceLock::new();
-    // SAFETY: sysconf has no preconditions
-    *PAGE_SIZE.get_or_init(|| unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize })
+    *PAGE_SIZE.get_or_init(get_page_size)
 }
 
 fn mmap_alloc(size: usize, flags: i32) -> Option<NonNull<[u8]>> {
@@ -27,7 +31,7 @@ fn mmap_alloc(size: usize, flags: i32) -> Option<NonNull<[u8]>> {
         return None;
     }
 
-    NonNull::new(ptr as *mut u8).map(|ptr| NonNull::slice_from_raw_parts(ptr, size))
+    NonNull::new(ptr.cast()).map(|ptr| NonNull::slice_from_raw_parts(ptr, size))
 }
 
 /// # Safety
@@ -41,13 +45,13 @@ unsafe fn mmap_resize(
     flags: i32,
 ) -> Option<NonNull<[u8]>> {
     // SAFETY: the caller guarantees `ptr..ptr + old` is exactly one mapping we created.
-    let ptr = unsafe { libc::mremap(ptr.as_ptr() as *mut _, old, new, flags) };
+    let ptr = unsafe { libc::mremap(ptr.as_ptr().cast(), old, new, flags) };
 
     if ptr == libc::MAP_FAILED {
         return None;
     }
 
-    NonNull::new(ptr as *mut u8).map(|ptr| NonNull::slice_from_raw_parts(ptr, new))
+    NonNull::new(ptr.cast()).map(|ptr| NonNull::slice_from_raw_parts(ptr, new))
 }
 
 /// # Safety
@@ -57,7 +61,7 @@ unsafe fn mmap_resize(
 unsafe fn mmap_free(ptr: NonNull<u8>, size: usize) {
     if size > 0 {
         // SAFETY: the caller guarantees ptr..ptr + size is exactly one mapping we created.
-        unsafe { libc::munmap(ptr.as_ptr() as *mut _, size) };
+        unsafe { libc::munmap(ptr.as_ptr().cast(), size) };
     }
 }
 
@@ -126,9 +130,8 @@ impl Mapping {
 
         if !manual {
             // SAFETY: the `Allocator` contract guarantees `ptr` comes from a valid allocation.
-            if let Some(ptr) =
-                unsafe { mmap_resize(ptr, old_round, new_round, libc::MREMAP_MAYMOVE) }
-            {
+            let resize = unsafe { mmap_resize(ptr, old_round, new_round, libc::MREMAP_MAYMOVE) };
+            if let Some(ptr) = resize {
                 return Ok((ptr, false));
             }
         }
@@ -183,7 +186,7 @@ impl Mapping {
                 block
                     .cast::<u8>()
                     .add(old.size())
-                    .write_bytes(0, self.round(old.size()) - old.size())
+                    .write_bytes(0, self.round(old.size()) - old.size());
             };
         }
 
@@ -261,7 +264,7 @@ impl<const SHIFT: u32> HugePageAllocator<SHIFT> {
     const SIZE: usize = 1 << SHIFT;
     const MAPPING: Mapping = Mapping {
         unit: Self::SIZE,
-        flags: libc::MAP_HUGETLB | ((SHIFT as i32) << libc::MAP_HUGE_SHIFT),
+        flags: libc::MAP_HUGETLB | (SHIFT.cast_signed() << libc::MAP_HUGE_SHIFT),
     };
 }
 
@@ -465,11 +468,12 @@ mod tests {
 
     #[test]
     fn boxed() {
+        #[repr(align(256))]
+        struct Aligned(u8);
+
         let b = Box::new_in([7u8; 10_000], PageAllocator);
         assert!(b.iter().all(|&x| x == 7));
 
-        #[repr(align(256))]
-        struct Aligned(u8);
         let b = Box::new_in(Aligned(1), PageAllocator);
         assert!((&raw const *b).is_aligned());
         assert_eq!(b.0, 1);
