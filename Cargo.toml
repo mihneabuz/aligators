@@ -8,6 +8,10 @@ edition = "2024"
 
 [dependencies]
 libc = "1.0.0-alpha.5"
+tracing = { version = "0.1.44", optional = true }
+
+[features]
+tracing = ["dep:tracing"]
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

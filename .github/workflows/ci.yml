@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
     runs-on: ubuntu-latest
@@ -31,7 +31,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       # Without reserved huge pages the huge page tests only check for a clean `AllocError`.
       - run: sudo sysctl -w vm.nr_hugepages=8
-      - run: cargo test -- --nocapture
+      - run: cargo test --all-features -- --nocapture
 
   miri:
     runs-on: ubuntu-latest
@@ -41,4 +41,4 @@ jobs:
       # Only this job needs Miri, so it isn't listed in rust-toolchain.toml.
       - run: rustup component add miri rust-src
       - run: cargo miri setup
-      - run: cargo miri test
+      - run: cargo miri test --all-features
