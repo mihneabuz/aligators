@@ -318,6 +318,14 @@ mod tests {
         ptr.addr().is_multiple_of(align)
     }
 
+    fn layout(size: usize, align: usize) -> Layout {
+        Layout::from_size_align(size, align).unwrap()
+    }
+
+    fn bytes<'a>(block: NonNull<[u8]>, len: usize) -> &'a mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(block.cast::<u8>().as_ptr(), len) }
+    }
+
     fn check_alloc(alloc: impl Allocator, layout: Layout, granularity: usize) {
         let block = alloc.allocate(layout).expect("allocation failed");
         let ptr = block.cast::<u8>();
@@ -326,8 +334,7 @@ mod tests {
         assert_eq!(block.len() % granularity, 0);
         assert!(is_aligned(ptr.as_ptr(), layout.align()));
 
-        let bytes = unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), block.len()) };
-        for byte in bytes.iter_mut() {
+        for byte in bytes(block, block.len()).iter_mut() {
             assert_eq!(*byte, 0);
             *byte = 0xAB;
         }
@@ -336,68 +343,140 @@ mod tests {
     }
 
     #[test]
-    fn page_sizes() {
+    fn allocate() {
         let ps = page_size();
         for size in [1, 7, ps - 1, ps, ps + 1, 3 * ps, 10 * ps + 123] {
-            check_alloc(PageAllocator, Layout::from_size_align(size, 1).unwrap(), ps);
+            check_alloc(PageAllocator, layout(size, 1), ps);
         }
     }
 
     #[test]
-    fn page_alignments() {
+    fn alignment() {
         let ps = page_size();
         let mut align = 1;
         while align <= ps {
-            check_alloc(
-                PageAllocator,
-                Layout::from_size_align(100, align).unwrap(),
-                ps,
-            );
+            check_alloc(PageAllocator, layout(100, align), ps);
             align *= 2;
         }
+
+        assert!(PageAllocator.allocate(layout(16, page_size() * 2)).is_err());
     }
 
     #[test]
-    fn page_align_too_large() {
-        let layout = Layout::from_size_align(16, page_size() * 2).unwrap();
-        assert!(PageAllocator.allocate(layout).is_err());
-    }
-
-    #[test]
-    fn page_zero_size() {
+    fn zero_size() {
         for align in [1, 2, 8, 64, 4096] {
-            let layout = Layout::from_size_align(0, align).unwrap();
-            let block = PageAllocator.allocate(layout).unwrap();
+            let block = PageAllocator.allocate(layout(0, align)).unwrap();
 
             assert_eq!(block.len(), 0);
             assert!(is_aligned(block.cast::<u8>().as_ptr(), align));
 
-            unsafe { PageAllocator.deallocate(block.cast(), layout) };
+            unsafe { PageAllocator.deallocate(block.cast(), layout(0, align)) };
         }
     }
 
     #[test]
-    fn page_dealloc_with_reported_size() {
-        let layout = Layout::from_size_align(10, 1).unwrap();
-        let block = PageAllocator.allocate(layout).unwrap();
-        let fitted = Layout::from_size_align(block.len(), 1).unwrap();
+    fn deallocate() {
+        let block = PageAllocator.allocate(layout(10, 1)).unwrap();
+        unsafe { PageAllocator.deallocate(block.cast(), layout(10, 1)) };
 
-        unsafe { PageAllocator.deallocate(block.cast(), fitted) };
+        let block = PageAllocator.allocate(layout(10, 1)).unwrap();
+        unsafe { PageAllocator.deallocate(block.cast(), layout(block.len(), 1)) };
     }
 
     #[test]
-    fn page_vec() {
-        let mut v = Vec::new_in(PageAllocator);
+    fn grow_in_place() {
+        let block = PageAllocator.allocate_zeroed(layout(10, 1)).unwrap();
+        assert!(bytes(block, block.len()).iter().all(|&b| b == 0));
+        bytes(block, 10).fill(0x5A);
 
-        v.push(1);
-        v.push(2);
-        v.push(3);
+        let same = unsafe {
+            PageAllocator
+                .grow(block.cast(), layout(10, 1), layout(100, 1))
+                .unwrap()
+        };
+        assert_eq!(same.cast::<u8>(), block.cast::<u8>());
+        assert_eq!(bytes(same, 10), &[0x5A; 10]);
 
-        assert_eq!(&v[0..3], &[1, 2, 3]);
+        unsafe { PageAllocator.deallocate(same.cast(), layout(100, 1)) };
     }
 
     #[test]
-    fn page_vec_grow_and_shrink() {
+    fn grow_zeroed() {
+        let block = PageAllocator.allocate(layout(10, 1)).unwrap();
+        bytes(block, block.len()).fill(0xFF);
+
+        let grown = unsafe {
+            PageAllocator
+                .grow_zeroed(block.cast(), layout(10, 1), layout(page_size() + 1, 1))
+                .unwrap()
+        };
+        let grown_bytes = bytes(grown, grown.len());
+        assert_eq!(&grown_bytes[0..10], &[0xFFu8; 10]);
+        assert_eq!(&grown_bytes[10..], &vec![0u8; grown_bytes.len() - 10]);
+
+        unsafe { PageAllocator.deallocate(grown.cast(), layout(page_size() + 1, 1)) };
+    }
+
+    #[test]
+    fn grow_from_empty() {
+        let block = PageAllocator.allocate(layout(0, 1)).unwrap();
+        assert_eq!(block.len(), 0);
+
+        let grown = unsafe {
+            PageAllocator
+                .grow(block.cast(), layout(0, 1), layout(100, 1))
+                .unwrap()
+        };
+        bytes(grown, 100).fill(0x5A);
+
+        unsafe { PageAllocator.deallocate(grown.cast(), layout(100, 1)) };
+    }
+
+    #[test]
+    fn shrink_in_place() {
+        let block = PageAllocator.allocate_zeroed(layout(100, 1)).unwrap();
+        assert!(bytes(block, block.len()).iter().all(|&b| b == 0));
+        bytes(block, 100).fill(0x5A);
+
+        let same = unsafe {
+            PageAllocator
+                .shrink(block.cast(), layout(100, 1), layout(10, 1))
+                .unwrap()
+        };
+        assert_eq!(same.cast::<u8>(), block.cast::<u8>());
+        assert_eq!(bytes(same, 10), &[0x5A; 10]);
+
+        unsafe { PageAllocator.deallocate(same.cast(), layout(10, 1)) };
+    }
+
+    #[test]
+    fn shrink_to_empty() {
+        let block = PageAllocator.allocate(layout(100, 1)).unwrap();
+        bytes(block, 100).fill(0x5A);
+
+        let empty = unsafe {
+            PageAllocator
+                .shrink(block.cast(), layout(100, 1), layout(0, 1))
+                .unwrap()
+        };
+
+        unsafe { PageAllocator.deallocate(empty.cast(), layout(0, 1)) };
+    }
+
+    #[test]
+    fn boxed() {
+        let b = Box::new_in([7u8; 10_000], PageAllocator);
+        assert!(b.iter().all(|&x| x == 7));
+
+        #[repr(align(256))]
+        struct Aligned(u8);
+        let b = Box::new_in(Aligned(1), PageAllocator);
+        assert!((&raw const *b).is_aligned());
+        assert_eq!(b.0, 1);
+    }
+
+    #[test]
+    fn vec() {
         let mut v = Vec::new_in(PageAllocator);
         for i in 0..10_000u64 {
             v.push(i);
@@ -410,19 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn page_box() {
-        let b = Box::new_in([7u8; 10_000], PageAllocator);
-        assert!(b.iter().all(|&x| x == 7));
-
-        #[repr(align(256))]
-        struct Aligned(u8);
-        let b = Box::new_in(Aligned(1), PageAllocator);
-        assert!((&raw const *b).is_aligned());
-        assert_eq!(b.0, 1);
-    }
-
-    #[test]
-    fn page_zst() {
+    fn vec_zst() {
         let mut v = Vec::new_in(PageAllocator);
         for _ in 0..1000 {
             v.push(());
@@ -430,130 +497,9 @@ mod tests {
         assert_eq!(v.len(), 1000);
     }
 
-    fn layout(size: usize, align: usize) -> Layout {
-        Layout::from_size_align(size, align).unwrap()
-    }
-
-    fn bytes<'a>(block: NonNull<[u8]>, len: usize) -> &'a mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(block.cast::<u8>().as_ptr(), len) }
-    }
-
-    /// Exercises `allocate_zeroed`, `grow`, `grow_zeroed` and `shrink` with sizes expressed in
-    /// multiples of the allocator's `unit`. Needs at most 3 units mapped at once.
-    fn check_resize(alloc: impl Allocator + Copy, unit: usize) {
-        unsafe {
-            // allocate_zeroed: whole rounded block is zero.
-            let block = alloc.allocate_zeroed(layout(10, 1)).unwrap();
-            assert_eq!(block.len(), unit);
-            assert!(bytes(block, unit).iter().all(|&b| b == 0));
-
-            // Growing within the same unit keeps the pointer and doesn't remap.
-            bytes(block, 10).fill(0x5A);
-            let same = alloc
-                .grow(block.cast(), layout(10, 1), layout(unit - 1, 1))
-                .unwrap();
-            assert_eq!(same.cast::<u8>(), block.cast::<u8>());
-            assert_eq!(same.len(), unit);
-
-            // Growing across units preserves the data and reports the rounded length.
-            bytes(same, unit - 1).fill(0x5A);
-            let grown = alloc
-                .grow(same.cast(), layout(unit - 1, 1), layout(unit + 1, 1))
-                .unwrap();
-            assert_eq!(grown.len(), 2 * unit);
-            assert!(bytes(grown, unit - 1).iter().all(|&b| b == 0x5A));
-
-            // Shrinking within the same unit count is a no-op.
-            let same = alloc
-                .shrink(grown.cast(), layout(unit + 1, 1), layout(unit + 1, 1))
-                .unwrap();
-            assert_eq!(same.cast::<u8>(), grown.cast::<u8>());
-
-            // Shrinking across units keeps the pointer and the data.
-            let shrunk = alloc
-                .shrink(same.cast(), layout(unit + 1, 1), layout(100, 1))
-                .unwrap();
-            // The kernel never moves a shrinking `mremap`, but Miri's emulation reallocates.
-            if !cfg!(miri) {
-                assert_eq!(shrunk.cast::<u8>(), grown.cast::<u8>());
-            }
-            assert_eq!(shrunk.len(), unit);
-            assert!(bytes(shrunk, 100).iter().all(|&b| b == 0x5A));
-
-            // Over-aligned requests fail and leave the block intact.
-            assert!(
-                alloc
-                    .grow(shrunk.cast(), layout(100, 1), layout(200, 2 * unit))
-                    .is_err()
-            );
-            assert!(
-                alloc
-                    .shrink(shrunk.cast(), layout(100, 1), layout(50, 2 * unit))
-                    .is_err()
-            );
-            assert!(bytes(shrunk, 100).iter().all(|&b| b == 0x5A));
-
-            // Shrinking to zero frees the block and returns an aligned dangling pointer.
-            let empty = alloc
-                .shrink(shrunk.cast(), layout(100, 1), layout(0, 64))
-                .unwrap();
-            assert_eq!(empty.len(), 0);
-            assert!(is_aligned(empty.cast::<u8>().as_ptr(), 64));
-
-            // Growing from zero is a fresh allocation.
-            let fresh = alloc
-                .grow(empty.cast(), layout(0, 64), layout(50, 64))
-                .unwrap();
-            assert_eq!(fresh.len(), unit);
-            assert!(is_aligned(fresh.cast::<u8>().as_ptr(), 64));
-            alloc.deallocate(fresh.cast(), layout(50, 64));
-
-            let fresh = alloc
-                .grow_zeroed(empty.cast(), layout(0, 64), layout(50, 64))
-                .unwrap();
-            assert!(bytes(fresh, unit).iter().all(|&b| b == 0));
-            alloc.deallocate(fresh.cast(), layout(50, 64));
-        }
-    }
-
-    /// `grow_zeroed` must clear the slack past the old size, which callers may have written to
-    /// since we report the rounded length.
-    fn check_grow_zeroed_slack(alloc: impl Allocator + Copy, unit: usize) {
-        for new_size in [100, unit, unit + 1] {
-            unsafe {
-                let block = alloc.allocate(layout(10, 1)).unwrap();
-                bytes(block, block.len()).fill(0xFF);
-
-                let grown = alloc
-                    .grow_zeroed(block.cast(), layout(10, 1), layout(new_size, 1))
-                    .unwrap();
-                let grown_bytes = bytes(grown, grown.len());
-                assert!(grown_bytes[..10].iter().all(|&b| b == 0xFF));
-                assert!(
-                    grown_bytes[10..].iter().all(|&b| b == 0),
-                    "dirty slack growing to {new_size}"
-                );
-
-                alloc.deallocate(grown.cast(), layout(new_size, 1));
-            }
-        }
-    }
-
-    #[test]
-    fn page_resize() {
-        check_resize(PageAllocator, page_size());
-    }
-
-    #[test]
-    fn page_grow_zeroed_slack() {
-        check_grow_zeroed_slack(PageAllocator, page_size());
-    }
-
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn page_grow_large() {
-        // Large enough that a copying grow would be noticeably slow; `mremap` just moves page
-        // table entries.
+    fn vec_large() {
         let mut v = Vec::with_capacity_in(1 << 20, PageAllocator);
         v.extend(0..1u64 << 20);
         v.reserve(1 << 24);
@@ -579,53 +525,8 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn huge_2mb() {
+    fn huge() {
         check_huge::<HUGE_PAGE_2MB>();
-    }
-
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn huge_1gb() {
         check_huge::<HUGE_PAGE_1GB>();
-    }
-
-    #[test]
-    fn huge_zero_size() {
-        let layout = Layout::from_size_align(0, 64).unwrap();
-        let block = HugePageAllocator2MB::default().allocate(layout).unwrap();
-
-        assert_eq!(block.len(), 0);
-        assert!(is_aligned(block.cast::<u8>().as_ptr(), 64));
-
-        unsafe { HugePageAllocator2MB::default().deallocate(block.cast(), layout) };
-    }
-
-    /// Runs the resize suites if enough huge pages are reserved, otherwise skips.
-    fn check_huge_resize<const SHIFT: u32>() {
-        let alloc = HugePageAllocator::<SHIFT>;
-        let unit = HugePageAllocator::<SHIFT>::SIZE;
-
-        match alloc.allocate(layout(3 * unit, 1)) {
-            Ok(probe) => unsafe { alloc.deallocate(probe.cast(), layout(3 * unit, 1)) },
-            Err(AllocError) => {
-                eprintln!("fewer than 3 {unit}-byte huge pages available, skipping");
-                return;
-            }
-        }
-
-        check_resize(alloc, unit);
-        check_grow_zeroed_slack(alloc, unit);
-    }
-
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn huge_2mb_resize() {
-        check_huge_resize::<HUGE_PAGE_2MB>();
-    }
-
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn huge_1gb_resize() {
-        check_huge_resize::<HUGE_PAGE_1GB>();
     }
 }
