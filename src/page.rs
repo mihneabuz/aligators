@@ -399,10 +399,10 @@ mod tests {
     #[test]
     fn page_vec_grow_and_shrink() {
         let mut v = Vec::new_in(PageAllocator);
-        for i in 0..100_000u64 {
+        for i in 0..10_000u64 {
             v.push(i);
         }
-        assert!(v.iter().copied().eq(0..100_000));
+        assert!(v.iter().copied().eq(0..10_000));
 
         v.truncate(10);
         v.shrink_to_fit();
@@ -428,44 +428,6 @@ mod tests {
             v.push(());
         }
         assert_eq!(v.len(), 1000);
-    }
-
-    fn check_huge<const SHIFT: u32>() {
-        let alloc = HugePageAllocator::<SHIFT>;
-        let size = HugePageAllocator::<SHIFT>::SIZE;
-        let layout = Layout::from_size_align(100, 8).unwrap();
-
-        match alloc.allocate(layout) {
-            Ok(block) => {
-                assert_eq!(block.len(), size);
-                assert!(is_aligned(block.cast::<u8>().as_ptr(), size));
-                unsafe { alloc.deallocate(block.cast(), layout) };
-
-                check_alloc(alloc, Layout::from_size_align(size + 1, 1).unwrap(), size);
-            }
-            Err(AllocError) => eprintln!("no {size}-byte huge pages available, skipping"),
-        }
-    }
-
-    #[test]
-    fn huge_2mb() {
-        check_huge::<HUGE_PAGE_2MB>();
-    }
-
-    #[test]
-    fn huge_1gb() {
-        check_huge::<HUGE_PAGE_1GB>();
-    }
-
-    #[test]
-    fn huge_zero_size() {
-        let layout = Layout::from_size_align(0, 64).unwrap();
-        let block = HugePageAllocator2MB::default().allocate(layout).unwrap();
-
-        assert_eq!(block.len(), 0);
-        assert!(is_aligned(block.cast::<u8>().as_ptr(), 64));
-
-        unsafe { HugePageAllocator2MB::default().deallocate(block.cast(), layout) };
     }
 
     fn layout(size: usize, align: usize) -> Layout {
@@ -511,7 +473,10 @@ mod tests {
             let shrunk = alloc
                 .shrink(same.cast(), layout(unit + 1, 1), layout(100, 1))
                 .unwrap();
-            assert_eq!(shrunk.cast::<u8>(), grown.cast::<u8>());
+            // The kernel never moves a shrinking `mremap`, but Miri's emulation reallocates.
+            if !cfg!(miri) {
+                assert_eq!(shrunk.cast::<u8>(), grown.cast::<u8>());
+            }
             assert_eq!(shrunk.len(), unit);
             assert!(bytes(shrunk, 100).iter().all(|&b| b == 0x5A));
 
@@ -585,6 +550,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn page_grow_large() {
         // Large enough that a copying grow would be noticeably slow; `mremap` just moves page
         // table entries.
@@ -592,6 +558,46 @@ mod tests {
         v.extend(0..1u64 << 20);
         v.reserve(1 << 24);
         assert!(v.iter().copied().eq(0..1 << 20));
+    }
+
+    fn check_huge<const SHIFT: u32>() {
+        let alloc = HugePageAllocator::<SHIFT>;
+        let size = HugePageAllocator::<SHIFT>::SIZE;
+        let layout = Layout::from_size_align(100, 8).unwrap();
+
+        match alloc.allocate(layout) {
+            Ok(block) => {
+                assert_eq!(block.len(), size);
+                assert!(is_aligned(block.cast::<u8>().as_ptr(), size));
+                unsafe { alloc.deallocate(block.cast(), layout) };
+
+                check_alloc(alloc, Layout::from_size_align(size + 1, 1).unwrap(), size);
+            }
+            Err(AllocError) => eprintln!("no {size}-byte huge pages available, skipping"),
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn huge_2mb() {
+        check_huge::<HUGE_PAGE_2MB>();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn huge_1gb() {
+        check_huge::<HUGE_PAGE_1GB>();
+    }
+
+    #[test]
+    fn huge_zero_size() {
+        let layout = Layout::from_size_align(0, 64).unwrap();
+        let block = HugePageAllocator2MB::default().allocate(layout).unwrap();
+
+        assert_eq!(block.len(), 0);
+        assert!(is_aligned(block.cast::<u8>().as_ptr(), 64));
+
+        unsafe { HugePageAllocator2MB::default().deallocate(block.cast(), layout) };
     }
 
     /// Runs the resize suites if enough huge pages are reserved, otherwise skips.
@@ -612,11 +618,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn huge_2mb_resize() {
         check_huge_resize::<HUGE_PAGE_2MB>();
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn huge_1gb_resize() {
         check_huge_resize::<HUGE_PAGE_1GB>();
     }

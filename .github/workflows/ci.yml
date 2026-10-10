@@ -30,6 +30,15 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       # Without reserved huge pages the huge page tests only check for a clean `AllocError`.
-      - name: Reserve huge pages
-        run: sudo sysctl -w vm.nr_hugepages=8
+      - run: sudo sysctl -w vm.nr_hugepages=8
       - run: cargo test -- --nocapture
+
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      # Only this job needs Miri, so it isn't listed in rust-toolchain.toml.
+      - run: rustup component add miri rust-src
+      - run: cargo miri setup
+      - run: cargo miri test
