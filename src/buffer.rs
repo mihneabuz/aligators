@@ -5,29 +5,54 @@ use std::{
     ptr::{self, NonNull},
 };
 
+// Use the most significant bit of the len field to keep track of
+// wether the buffer is currently in use.
+const USED_BIT: usize = 1 << 63;
+const LEN_MASK: usize = !USED_BIT;
+
 #[derive(Debug)]
 pub struct BufferAllocator<'a> {
-    buffer: NonNull<[u8]>,
-    used: Cell<bool>,
+    buf: NonNull<u8>,
+    len: Cell<usize>,
     _marker: PhantomData<&'a mut [u8]>,
 }
 
 impl<'a> BufferAllocator<'a> {
-    pub fn new(buffer: &'a mut [u8]) -> Self {
+    pub fn new(buf: &'a mut [u8]) -> Self {
+        if buf.len() >= USED_BIT {
+            panic!("Buffer is too big");
+        }
+
         Self {
-            buffer: NonNull::from_mut(buffer),
-            used: Cell::new(false),
+            buf: NonNull::new(buf.as_mut_ptr()).unwrap(),
+            len: Cell::new(buf.len()),
             _marker: PhantomData,
         }
     }
 
+    fn len(&self) -> usize {
+        self.len.get() & LEN_MASK
+    }
+
+    fn is_used(&self) -> bool {
+        self.len.get() & USED_BIT > 0
+    }
+
+    fn set_used(&self, used: bool) {
+        self.len.set(if used {
+            self.len.get() | USED_BIT
+        } else {
+            self.len.get() & LEN_MASK
+        });
+    }
+
     fn align(&self, layout: Layout) -> Option<NonNull<[u8]>> {
-        let (base, len) = (self.buffer.cast::<u8>(), self.buffer.len());
+        let (base, len) = (self.buf.cast::<u8>(), self.len());
         let offset = base.align_offset(layout.align());
         if offset > len || len - offset < layout.size() {
             return None;
         }
-        // SAFETY: offset is in `0..len` so the slice fits in `buffer`
+        // SAFETY: offset is in `0..len` so the slice fits in `buf`
         Some(unsafe { NonNull::slice_from_raw_parts(base.byte_add(offset), len - offset) })
     }
 
@@ -36,13 +61,13 @@ impl<'a> BufferAllocator<'a> {
             return Ok(NonNull::slice_from_raw_parts(layout.dangling_ptr(), 0));
         }
 
-        if self.used.get() {
+        if self.is_used() {
             return Err(AllocError);
         }
 
         let aligned = self.align(layout).ok_or(AllocError)?;
 
-        self.used.set(true);
+        self.set_used(true);
 
         if zero {
             // SAFETY: `aligned` is a valid slice of the buffer
@@ -59,7 +84,7 @@ impl<'a> BufferAllocator<'a> {
     /// Same as [`Allocator::deallocate`], for a block returned by this mapping.
     unsafe fn dealloc(&self, layout: Layout) {
         if layout.size() > 0 {
-            self.used.set(false);
+            self.set_used(false);
         }
     }
 
@@ -78,17 +103,17 @@ impl<'a> BufferAllocator<'a> {
         }
 
         if new.size() == 0 {
-            self.used.set(false);
+            self.set_used(false);
             return Ok(NonNull::slice_from_raw_parts(new.dangling_ptr(), 0));
         }
 
         // SAFETY: a non-empty block always lies within the buffer, at or after its start.
-        let offset = unsafe { ptr.offset_from_unsigned(self.buffer.cast::<u8>()) };
-        let in_place = ptr.addr().get().is_multiple_of(new.align())
-            && self.buffer.len() - offset >= new.size();
+        let offset = unsafe { ptr.offset_from_unsigned(self.buf.cast::<u8>()) };
+        let in_place =
+            ptr.addr().get().is_multiple_of(new.align()) && self.len() - offset >= new.size();
 
         let block = if in_place {
-            NonNull::slice_from_raw_parts(ptr, self.buffer.len() - offset)
+            NonNull::slice_from_raw_parts(ptr, self.len() - offset)
         } else {
             let block = self.align(new).ok_or(AllocError)?;
             // SAFETY: both ranges are inside the buffer; `copy` handles the overlap.
