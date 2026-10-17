@@ -9,11 +9,6 @@ fn get_page_size() -> usize {
     unsafe { usize::try_from(libc::sysconf(libc::_SC_PAGESIZE)).expect("Failed to get page size") }
 }
 
-fn page_size() -> usize {
-    static PAGE_SIZE: OnceLock<usize> = OnceLock::new();
-    *PAGE_SIZE.get_or_init(get_page_size)
-}
-
 fn mmap_alloc(size: usize, flags: i32) -> Option<NonNull<[u8]>> {
     // SAFETY: the mapping is private and anonymous
     let ptr = unsafe {
@@ -200,9 +195,17 @@ pub struct PageAllocator;
 impl PageAllocator {
     fn mapping() -> Mapping {
         Mapping {
-            unit: page_size(),
+            unit: Self::page_size(),
             flags: 0,
         }
+    }
+}
+
+impl PageAllocator {
+    #[must_use]
+    pub fn page_size() -> usize {
+        static PAGE_SIZE: OnceLock<usize> = OnceLock::new();
+        *PAGE_SIZE.get_or_init(get_page_size)
     }
 }
 
@@ -266,6 +269,13 @@ impl<const SHIFT: u32> HugePageAllocator<SHIFT> {
         unit: Self::SIZE,
         flags: libc::MAP_HUGETLB | (SHIFT.cast_signed() << libc::MAP_HUGE_SHIFT),
     };
+}
+
+impl<const SHIFT: u32> HugePageAllocator<SHIFT> {
+    #[must_use]
+    pub fn page_size() -> usize {
+        Self::SIZE
+    }
 }
 
 unsafe impl<const SHIFT: u32> Allocator for HugePageAllocator<SHIFT> {
@@ -347,7 +357,7 @@ mod tests {
 
     #[test]
     fn allocate() {
-        let ps = page_size();
+        let ps = PageAllocator::page_size();
         for size in [1, 7, ps - 1, ps, ps + 1, 3 * ps, 10 * ps + 123] {
             check_alloc(PageAllocator, layout(size, 1), ps);
         }
@@ -355,14 +365,18 @@ mod tests {
 
     #[test]
     fn alignment() {
-        let ps = page_size();
+        let ps = PageAllocator::page_size();
         let mut align = 1;
         while align <= ps {
             check_alloc(PageAllocator, layout(100, align), ps);
             align *= 2;
         }
 
-        assert!(PageAllocator.allocate(layout(16, page_size() * 2)).is_err());
+        assert!(
+            PageAllocator
+                .allocate(layout(16, PageAllocator::page_size() * 2))
+                .is_err()
+        );
     }
 
     #[test]
@@ -410,14 +424,20 @@ mod tests {
 
         let grown = unsafe {
             PageAllocator
-                .grow_zeroed(block.cast(), layout(10, 1), layout(page_size() + 1, 1))
+                .grow_zeroed(
+                    block.cast(),
+                    layout(10, 1),
+                    layout(PageAllocator::page_size() + 1, 1),
+                )
                 .unwrap()
         };
         let grown_bytes = bytes(grown, grown.len());
         assert_eq!(&grown_bytes[0..10], &[0xFFu8; 10]);
         assert_eq!(&grown_bytes[10..], &vec![0u8; grown_bytes.len() - 10]);
 
-        unsafe { PageAllocator.deallocate(grown.cast(), layout(page_size() + 1, 1)) };
+        unsafe {
+            PageAllocator.deallocate(grown.cast(), layout(PageAllocator::page_size() + 1, 1))
+        };
     }
 
     #[test]
@@ -512,7 +532,7 @@ mod tests {
 
     fn check_huge<const SHIFT: u32>() {
         let alloc = HugePageAllocator::<SHIFT>;
-        let size = HugePageAllocator::<SHIFT>::SIZE;
+        let size = HugePageAllocator::<SHIFT>::page_size();
         let layout = Layout::from_size_align(100, 8).unwrap();
 
         match alloc.allocate(layout) {
