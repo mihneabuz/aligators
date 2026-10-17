@@ -18,10 +18,12 @@ pub struct BufferAllocator<'a> {
 }
 
 impl<'a> BufferAllocator<'a> {
+    /// Create a new allocator backed by `buf`.
+    ///
+    /// # Panics
+    /// When `buf` is bigger than `1 << 63`.
     pub fn new(buf: &'a mut [u8]) -> Self {
-        if buf.len() >= USED_BIT {
-            panic!("Buffer is too big");
-        }
+        assert!(buf.len() < USED_BIT, "Buffer is too big");
 
         Self {
             buf: NonNull::new(buf.as_mut_ptr()).unwrap(),
@@ -49,7 +51,7 @@ impl<'a> BufferAllocator<'a> {
     fn align(&self, layout: Layout) -> Option<NonNull<[u8]>> {
         let (base, len) = (self.buf.cast::<u8>(), self.len());
         let offset = base.align_offset(layout.align());
-        if offset > len || len - offset < layout.size() {
+        if offset + layout.size() > len {
             return None;
         }
         // SAFETY: offset is in `0..len` so the slice fits in `buf`
@@ -353,7 +355,7 @@ mod tests {
         let growner = unsafe { alloc.grow(grown.cast(), layout(16, 2), layout(32, 8)) }.unwrap();
         assert_eq!(&bytes(growner)[..8], b"aligator");
 
-        unsafe { alloc.deallocate(block.cast(), layout(32, 8)) };
+        unsafe { alloc.deallocate(growner.cast(), layout(32, 8)) };
     }
 
     #[test]
@@ -388,7 +390,7 @@ mod tests {
         let shrunker = unsafe { alloc.shrink(shrunk.cast(), layout(16, 1), layout(8, 8)) }.unwrap();
         assert_eq!(&bytes(shrunker)[..8], b"aligator");
 
-        unsafe { alloc.deallocate(shrunk.cast(), layout(8, 8)) };
+        unsafe { alloc.deallocate(shrunker.cast(), layout(8, 8)) };
     }
 
     #[test]
