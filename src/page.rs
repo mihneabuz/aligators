@@ -4,62 +4,78 @@ use std::{
     sync::OnceLock,
 };
 
-fn get_page_size() -> usize {
-    // SAFETY: sysconf is available on any Linux and has no preconditions
-    unsafe { usize::try_from(libc::sysconf(libc::_SC_PAGESIZE)).expect("Failed to get page size") }
-}
+mod sys {
+    use std::ptr::{self, NonNull};
 
-fn mmap_alloc(size: usize, flags: i32) -> Option<NonNull<[u8]>> {
-    // SAFETY: the mapping is private and anonymous
-    let ptr = unsafe {
-        libc::mmap(
-            ptr::null_mut(),
-            size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | flags,
-            -1,
-            0,
-        )
-    };
-
-    if ptr == libc::MAP_FAILED {
-        return None;
+    pub fn get_page_size() -> usize {
+        // SAFETY: sysconf(SC_PAGESIZE) is available on any Linux and has no preconditions.
+        unsafe {
+            usize::try_from(libc::sysconf(libc::_SC_PAGESIZE)).expect("Failed to get page size")
+        }
     }
 
-    NonNull::new(ptr.cast()).map(|ptr| NonNull::slice_from_raw_parts(ptr, size))
+    pub fn mmap(size: usize, flags: i32) -> Option<NonNull<[u8]>> {
+        // SAFETY: the mapping is private and anonymous, with no backing file.
+        let ptr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | flags,
+                -1,
+                0,
+            )
+        };
+
+        if ptr == libc::MAP_FAILED {
+            return None;
+        }
+
+        NonNull::new(ptr.cast()).map(|ptr| NonNull::slice_from_raw_parts(ptr, size))
+    }
+
+    /// # Safety
+    ///
+    /// `ptr` must have been returned by `mmap` with the same `size` as `old`, and it must
+    /// not be used to access memory after this call. `new` must be > 0.
+    pub unsafe fn mremap(ptr: NonNull<u8>, old: usize, new: usize) -> Option<NonNull<[u8]>> {
+        // SAFETY: the caller guarantees `ptr..ptr + old` is exactly one mapping we created.
+        let new_ptr = unsafe { libc::mremap(ptr.as_ptr().cast(), old, new, libc::MREMAP_MAYMOVE) };
+
+        if new_ptr == libc::MAP_FAILED {
+            return None;
+        }
+
+        NonNull::new(new_ptr.cast()).map(|ptr| NonNull::slice_from_raw_parts(ptr, new))
+    }
+
+    /// # Safety
+    ///
+    /// `ptr` must have been returned by `mmap` with the same `size`, and it must not be used
+    /// to access memory after this call.
+    pub unsafe fn munmap(ptr: NonNull<u8>, size: usize) {
+        if size > 0 {
+            // SAFETY: the caller guarantees ptr..ptr + size is exactly one mapping we created.
+            unsafe { libc::munmap(ptr.as_ptr().cast(), size) };
+        }
+    }
 }
 
+/// Generic type used to allocate both normal and huge pages.
+///
 /// # Safety
 ///
-/// `ptr` must have been returned by `mmap_alloc` with the same `size` as `old`, and it must not
-/// be used to access memory after this call. `new` must be > 0.
-unsafe fn mmap_resize(
-    ptr: NonNull<u8>,
-    old: usize,
-    new: usize,
-    flags: i32,
-) -> Option<NonNull<[u8]>> {
-    // SAFETY: the caller guarantees `ptr..ptr + old` is exactly one mapping we created.
-    let ptr = unsafe { libc::mremap(ptr.as_ptr().cast(), old, new, flags) };
-
-    if ptr == libc::MAP_FAILED {
-        return None;
-    }
-
-    NonNull::new(ptr.cast()).map(|ptr| NonNull::slice_from_raw_parts(ptr, new))
-}
-
-/// # Safety
+/// New allocations use `mmap` with private, anonymous flags, which will always returns disjoint
+/// pages of memory for the process. This memory is also guaranteed to be zeroed.
 ///
-/// `ptr` must have been returned by `mmap_alloc` with the same `size`, and it must not be used
-/// to access memory after this call.
-unsafe fn mmap_free(ptr: NonNull<u8>, size: usize) {
-    if size > 0 {
-        // SAFETY: the caller guarantees ptr..ptr + size is exactly one mapping we created.
-        unsafe { libc::munmap(ptr.as_ptr().cast(), size) };
-    }
-}
-
+/// Deallocation is done with `munmap`, and resizing (grow/shrink) use the `mremap` if possible,
+/// falling back to manual reallocation and copy if that fails. Both `munmap` and `mremap` must be
+/// called with the same size as the initial `mmap` which returned the pointer.
+///
+/// The [`Allocator`] contract only guarantees that the size of the layour will be between the
+/// size requested by the caller and the actual size returned by the allocator. We can get exact
+/// size from this range by rounding up to the page size, which is constant for all page allocators.
+///
 #[derive(Clone, Copy)]
 struct Mapping {
     unit: usize,
@@ -72,15 +88,17 @@ impl Mapping {
     }
 
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        // ZST don't require an allocation.
         if layout.size() == 0 {
             return Ok(NonNull::slice_from_raw_parts(layout.dangling_ptr(), 0));
         }
 
+        // Check if the required alignment is greater than the page size.
         if layout.align() > self.unit {
             return Err(AllocError);
         }
 
-        mmap_alloc(self.round(layout.size()), self.flags).ok_or(AllocError)
+        sys::mmap(self.round(layout.size()), self.flags).ok_or(AllocError)
     }
 
     /// # Safety
@@ -88,7 +106,7 @@ impl Mapping {
     /// Same as [`Allocator::deallocate`], for a block returned by this mapping.
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
         // SAFETY: the `Allocator` contract guarantees `ptr` comes from a valid allocation.
-        unsafe { mmap_free(ptr, self.round(layout.size())) }
+        unsafe { sys::munmap(ptr, self.round(layout.size())) }
     }
 
     /// # Safety
@@ -96,7 +114,8 @@ impl Mapping {
     /// Same as [`Allocator::grow`] / [`Allocator::shrink`], for a block returned by this mapping.
     ///
     /// When manual is true, skip trying the `mremap` and do a fresh `mmap`.
-    /// Also returns wether the new allocation is a fresh `mmap`.
+    /// Also returns Ok((_, true)) when the new allocation is a fresh `mmap`, or a dangling pointer
+    /// for a ZST allocation.
     unsafe fn resize_inner(
         &self,
         ptr: NonNull<u8>,
@@ -104,34 +123,42 @@ impl Mapping {
         new: Layout,
         manual: bool,
     ) -> Result<(NonNull<[u8]>, bool), AllocError> {
-        if new.align() > self.unit {
-            return Err(AllocError);
-        }
-
+        // Check if the old allocation was a ZST.
         if old.size() == 0 {
             return self.allocate(new).map(|ptr| (ptr, true));
         }
 
+        // Check if the required alignment is greater than the page size.
+        if new.align() > self.unit {
+            return Err(AllocError);
+        }
+
+        // Check if the new allocation is a ZST.
         if new.size() == 0 {
             // SAFETY: the `Allocator` contract guarantees `ptr` comes from a valid allocation.
-            unsafe { self.deallocate(ptr, old) };
+            unsafe {
+                self.deallocate(ptr, old);
+            }
+
             return Ok((NonNull::slice_from_raw_parts(new.dangling_ptr(), 0), true));
         }
 
-        let (old_round, new_round) = (self.round(old.size()), self.round(new.size()));
-        if old_round == new_round {
-            return Ok((NonNull::slice_from_raw_parts(ptr, new_round), false));
+        // Check if the new size requested actually fits in the same block.
+        let (old_rounded, new_rounded) = (self.round(old.size()), self.round(new.size()));
+        if old_rounded == new_rounded {
+            return Ok((NonNull::slice_from_raw_parts(ptr, new_rounded), false));
         }
 
         if !manual {
             // SAFETY: the `Allocator` contract guarantees `ptr` comes from a valid allocation.
-            let resize = unsafe { mmap_resize(ptr, old_round, new_round, libc::MREMAP_MAYMOVE) };
-            if let Some(ptr) = resize {
+            if let Some(ptr) = unsafe { sys::mremap(ptr, old_rounded, new_rounded) } {
                 return Ok((ptr, false));
             }
         }
 
+        // Fallback to manual reallocation.
         let block = self.allocate(new)?;
+
         // SAFETY: `ptr` and `block` come from different allocations and the size is within bounds.
         unsafe {
             ptr::copy_nonoverlapping(
@@ -139,6 +166,10 @@ impl Mapping {
                 block.cast().as_ptr(),
                 old.size().min(new.size()),
             );
+        }
+
+        // SAFETY: the `Allocator` contract guarantees `ptr` comes from a valid allocation.
+        unsafe {
             self.deallocate(ptr, old);
         }
 
@@ -189,10 +220,19 @@ impl Mapping {
     }
 }
 
+/// Simple page allocator based on `mmap` family of syscalls.
+///
+/// New allocations use `mmap`, grow/shrink always try to use `mremap` to attempt in-place resize,
+/// and deallocations go through `munmap`.
+///
+/// All allocations will be multiples of [`Page::page_size()`], which can be quite large for most
+/// uses, so it is recommended to combine it with a [`Bump`] or [`Arena`] when doing many smaller
+/// allocations.
+///
 #[derive(Clone, Copy, Debug, Default)]
-pub struct PageAllocator;
+pub struct Page;
 
-impl PageAllocator {
+impl Page {
     fn mapping() -> Mapping {
         Mapping {
             unit: Self::page_size(),
@@ -201,15 +241,75 @@ impl PageAllocator {
     }
 }
 
-impl PageAllocator {
+impl Page {
+    /// Returns the size of a page of memory on the current system.
+    /// This is also the smallest unit of memory that this allocator can provide.
+    ///
     #[must_use]
     pub fn page_size() -> usize {
         static PAGE_SIZE: OnceLock<usize> = OnceLock::new();
-        *PAGE_SIZE.get_or_init(get_page_size)
+        *PAGE_SIZE.get_or_init(sys::get_page_size)
     }
 }
 
-unsafe impl Allocator for PageAllocator {
+/// Huge page allocator based on `mmap` family of syscalls.
+///
+/// Same as [`Page`] except it allocates huge pages instead of regular pages. These pages are
+/// much bigger in size, depending on the target system. On common hardware, the [`HUGE_PAGE_2MB`]
+/// and [`HUGE_PAGE_1GB`] are most probable to be supported.
+///
+/// Having hardware support for huge pages is not sufficient for this allocator to work, you
+/// must also have some huge pages reserved by the operating system. Failing to do this will
+/// result in all allocations returning `AllocError`.
+///
+/// Huge pages do not support growing in place, so [`Allocator::grow`] and
+/// [`Allocator::grow_zeroed`] will have to reallocate and copy the contents, unless the new
+/// size fits in the same huge pages.
+///
+/// For convenience, it is recommended to use these types instead:
+///  - [`HugePage2MB`]
+///  - [`HugePage1GB`]
+///
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HugePage<const SHIFT: u32 = HUGE_PAGE_2MB>;
+
+pub const HUGE_PAGE_2MB: u32 = 21;
+pub const HUGE_PAGE_1GB: u32 = 30;
+
+/// Huge page allocator, with 2 MB huge pages, based on `mmap` family of syscalls.
+///
+/// For more details, please see [`crate::page::HugePage`].
+///
+pub type HugePage2MB = HugePage<HUGE_PAGE_2MB>;
+
+/// Huge page allocator, with 1 GB huge pages, based on `mmap` family of syscalls.
+///
+/// For more details, please see [`crate::page::HugePage`].
+///
+pub type HugePage1GB = HugePage<HUGE_PAGE_1GB>;
+
+impl<const SHIFT: u32> HugePage<SHIFT> {
+    const SIZE: usize = 1 << SHIFT;
+    const MAPPING: Mapping = Mapping {
+        unit: Self::SIZE,
+        flags: libc::MAP_HUGETLB | (SHIFT.cast_signed() << libc::MAP_HUGE_SHIFT),
+    };
+}
+
+impl<const SHIFT: u32> HugePage<SHIFT> {
+    /// Returns the size of a huge page for this specific allocator.
+    /// Note that the target system might not actually support this page size, or might not have
+    /// any pages of this size allocated by the operating system. This function does not guarantee
+    /// that allocations from this allocator will succeed.
+    ///
+    #[must_use]
+    pub fn page_size() -> usize {
+        Self::SIZE
+    }
+}
+
+// SAFETY: See safety docs for `Mapping`.
+unsafe impl Allocator for Page {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         Self::mapping().allocate(layout)
     }
@@ -254,31 +354,8 @@ unsafe impl Allocator for PageAllocator {
     }
 }
 
-pub const HUGE_PAGE_2MB: u32 = 21;
-pub const HUGE_PAGE_1GB: u32 = 30;
-
-pub type HugePageAllocator2MB = HugePageAllocator<HUGE_PAGE_2MB>;
-pub type HugePageAllocator1GB = HugePageAllocator<HUGE_PAGE_1GB>;
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct HugePageAllocator<const SHIFT: u32 = HUGE_PAGE_2MB>;
-
-impl<const SHIFT: u32> HugePageAllocator<SHIFT> {
-    const SIZE: usize = 1 << SHIFT;
-    const MAPPING: Mapping = Mapping {
-        unit: Self::SIZE,
-        flags: libc::MAP_HUGETLB | (SHIFT.cast_signed() << libc::MAP_HUGE_SHIFT),
-    };
-}
-
-impl<const SHIFT: u32> HugePageAllocator<SHIFT> {
-    #[must_use]
-    pub fn page_size() -> usize {
-        Self::SIZE
-    }
-}
-
-unsafe impl<const SHIFT: u32> Allocator for HugePageAllocator<SHIFT> {
+// SAFETY: See safety docs for `Mapping`.
+unsafe impl<const SHIFT: u32> Allocator for HugePage<SHIFT> {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         Self::MAPPING.allocate(layout)
     }
@@ -320,237 +397,5 @@ unsafe impl<const SHIFT: u32> Allocator for HugePageAllocator<SHIFT> {
     ) -> Result<NonNull<[u8]>, AllocError> {
         // SAFETY: forwarded from the caller.
         unsafe { Self::MAPPING.resize(ptr, old_layout, new_layout, false) }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn is_aligned<T>(ptr: *const T, align: usize) -> bool {
-        ptr.addr().is_multiple_of(align)
-    }
-
-    fn layout(size: usize, align: usize) -> Layout {
-        Layout::from_size_align(size, align).unwrap()
-    }
-
-    fn bytes<'a>(block: NonNull<[u8]>, len: usize) -> &'a mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(block.cast::<u8>().as_ptr(), len) }
-    }
-
-    fn check_alloc(alloc: impl Allocator, layout: Layout, granularity: usize) {
-        let block = alloc.allocate(layout).expect("allocation failed");
-        let ptr = block.cast::<u8>();
-
-        assert!(block.len() >= layout.size());
-        assert_eq!(block.len() % granularity, 0);
-        assert!(is_aligned(ptr.as_ptr(), layout.align()));
-
-        for byte in bytes(block, block.len()).iter_mut() {
-            assert_eq!(*byte, 0);
-            *byte = 0xAB;
-        }
-
-        unsafe { alloc.deallocate(ptr, layout) };
-    }
-
-    #[test]
-    fn allocate() {
-        let ps = PageAllocator::page_size();
-        for size in [1, 7, ps - 1, ps, ps + 1, 3 * ps, 10 * ps + 123] {
-            check_alloc(PageAllocator, layout(size, 1), ps);
-        }
-    }
-
-    #[test]
-    fn alignment() {
-        let ps = PageAllocator::page_size();
-        let mut align = 1;
-        while align <= ps {
-            check_alloc(PageAllocator, layout(100, align), ps);
-            align *= 2;
-        }
-
-        assert!(
-            PageAllocator
-                .allocate(layout(16, PageAllocator::page_size() * 2))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn zero_size() {
-        for align in [1, 2, 8, 64, 4096] {
-            let block = PageAllocator.allocate(layout(0, align)).unwrap();
-
-            assert_eq!(block.len(), 0);
-            assert!(is_aligned(block.cast::<u8>().as_ptr(), align));
-
-            unsafe { PageAllocator.deallocate(block.cast(), layout(0, align)) };
-        }
-    }
-
-    #[test]
-    fn deallocate() {
-        let block = PageAllocator.allocate(layout(10, 1)).unwrap();
-        unsafe { PageAllocator.deallocate(block.cast(), layout(10, 1)) };
-
-        let block = PageAllocator.allocate(layout(10, 1)).unwrap();
-        unsafe { PageAllocator.deallocate(block.cast(), layout(block.len(), 1)) };
-    }
-
-    #[test]
-    fn grow_in_place() {
-        let block = PageAllocator.allocate_zeroed(layout(10, 1)).unwrap();
-        assert!(bytes(block, block.len()).iter().all(|&b| b == 0));
-        bytes(block, 10).fill(0x5A);
-
-        let same = unsafe {
-            PageAllocator
-                .grow(block.cast(), layout(10, 1), layout(100, 1))
-                .unwrap()
-        };
-        assert_eq!(same.cast::<u8>(), block.cast::<u8>());
-        assert_eq!(bytes(same, 10), &[0x5A; 10]);
-
-        unsafe { PageAllocator.deallocate(same.cast(), layout(100, 1)) };
-    }
-
-    #[test]
-    fn grow_zeroed() {
-        let block = PageAllocator.allocate(layout(10, 1)).unwrap();
-        bytes(block, block.len()).fill(0xFF);
-
-        let grown = unsafe {
-            PageAllocator
-                .grow_zeroed(
-                    block.cast(),
-                    layout(10, 1),
-                    layout(PageAllocator::page_size() + 1, 1),
-                )
-                .unwrap()
-        };
-        let grown_bytes = bytes(grown, grown.len());
-        assert_eq!(&grown_bytes[0..10], &[0xFFu8; 10]);
-        assert_eq!(&grown_bytes[10..], &vec![0u8; grown_bytes.len() - 10]);
-
-        unsafe {
-            PageAllocator.deallocate(grown.cast(), layout(PageAllocator::page_size() + 1, 1))
-        };
-    }
-
-    #[test]
-    fn grow_from_empty() {
-        let block = PageAllocator.allocate(layout(0, 1)).unwrap();
-        assert_eq!(block.len(), 0);
-
-        let grown = unsafe {
-            PageAllocator
-                .grow(block.cast(), layout(0, 1), layout(100, 1))
-                .unwrap()
-        };
-        bytes(grown, 100).fill(0x5A);
-
-        unsafe { PageAllocator.deallocate(grown.cast(), layout(100, 1)) };
-    }
-
-    #[test]
-    fn shrink_in_place() {
-        let block = PageAllocator.allocate_zeroed(layout(100, 1)).unwrap();
-        assert!(bytes(block, block.len()).iter().all(|&b| b == 0));
-        bytes(block, 100).fill(0x5A);
-
-        let same = unsafe {
-            PageAllocator
-                .shrink(block.cast(), layout(100, 1), layout(10, 1))
-                .unwrap()
-        };
-        assert_eq!(same.cast::<u8>(), block.cast::<u8>());
-        assert_eq!(bytes(same, 10), &[0x5A; 10]);
-
-        unsafe { PageAllocator.deallocate(same.cast(), layout(10, 1)) };
-    }
-
-    #[test]
-    fn shrink_to_empty() {
-        let block = PageAllocator.allocate(layout(100, 1)).unwrap();
-        bytes(block, 100).fill(0x5A);
-
-        let empty = unsafe {
-            PageAllocator
-                .shrink(block.cast(), layout(100, 1), layout(0, 1))
-                .unwrap()
-        };
-
-        unsafe { PageAllocator.deallocate(empty.cast(), layout(0, 1)) };
-    }
-
-    #[test]
-    fn boxed() {
-        #[repr(align(256))]
-        struct Aligned(u8);
-
-        let b = Box::new_in([7u8; 10_000], PageAllocator);
-        assert!(b.iter().all(|&x| x == 7));
-
-        let b = Box::new_in(Aligned(1), PageAllocator);
-        assert!((&raw const *b).is_aligned());
-        assert_eq!(b.0, 1);
-    }
-
-    #[test]
-    fn vec() {
-        let mut v = Vec::new_in(PageAllocator);
-        for i in 0..10_000u64 {
-            v.push(i);
-        }
-        assert!(v.iter().copied().eq(0..10_000));
-
-        v.truncate(10);
-        v.shrink_to_fit();
-        assert_eq!(&v[..], &(0..10).collect::<Vec<_>>()[..]);
-    }
-
-    #[test]
-    fn vec_zst() {
-        let mut v = Vec::new_in(PageAllocator);
-        for _ in 0..1000 {
-            v.push(());
-        }
-        assert_eq!(v.len(), 1000);
-    }
-
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn vec_large() {
-        let mut v = Vec::with_capacity_in(1 << 20, PageAllocator);
-        v.extend(0..1u64 << 20);
-        v.reserve(1 << 24);
-        assert!(v.iter().copied().eq(0..1 << 20));
-    }
-
-    fn check_huge<const SHIFT: u32>() {
-        let alloc = HugePageAllocator::<SHIFT>;
-        let size = HugePageAllocator::<SHIFT>::page_size();
-        let layout = Layout::from_size_align(100, 8).unwrap();
-
-        match alloc.allocate(layout) {
-            Ok(block) => {
-                assert_eq!(block.len(), size);
-                assert!(is_aligned(block.cast::<u8>().as_ptr(), size));
-                unsafe { alloc.deallocate(block.cast(), layout) };
-
-                check_alloc(alloc, Layout::from_size_align(size + 1, 1).unwrap(), size);
-            }
-            Err(AllocError) => eprintln!("no {size}-byte huge pages available, skipping"),
-        }
-    }
-
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn huge() {
-        check_huge::<HUGE_PAGE_2MB>();
-        check_huge::<HUGE_PAGE_1GB>();
     }
 }
