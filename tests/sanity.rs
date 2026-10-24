@@ -3,10 +3,16 @@ use std::{
     ptr::NonNull,
 };
 
+#[cfg(target_os = "linux")]
+use std::{
+    fs,
+    sync::{Mutex, MutexGuard, PoisonError},
+};
+
 use aligators::{Arena, AtomicBump, Buffer, Bump};
 
 #[cfg(target_os = "linux")]
-use aligators::page::Page;
+use aligators::page::{HugePage2MB, Page};
 
 fn layout(size: usize, align: usize) -> Layout {
     Layout::from_size_align(size, align).unwrap()
@@ -275,17 +281,45 @@ fn boxed(alloc: &dyn Allocator) {
     assert_eq!(&*big, &[8u8; 100]);
 }
 
+/// Huge pages only work when the OS has some reserved, and each check holds a few at once. Checks
+/// take a lock so they run one at a time, and are skipped unless enough pages are free.
+#[cfg(target_os = "linux")]
+fn huge_pages() -> Option<MutexGuard<'static, ()>> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    let guard = LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+
+    let free = fs::read_to_string("/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages")
+        .ok()
+        .and_then(|free| free.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    if free < 8 {
+        eprintln!("fewer than 8 free huge pages, skipping");
+        return None;
+    }
+    Some(guard)
+}
+
 macro_rules! sanity {
-    ($($(#[$meta:meta])* $name:ident => $make:expr; [$($(#[$check_meta:meta])* $check:ident),* $(,)?])*) => {
+    ($(
+        $(#[$meta:meta])* $name:ident => $make:expr $(, if $cond:expr)?;
+            [$($(#[$check_meta:meta])* $check:ident),* $(,)?]
+    )*) => {
         $(
             $(#[$meta])*
             mod $name {
                 #[allow(unused_imports)]
                 use super::*;
+
+                // Returns `None` to skip the check, or a guard to hold while it runs.
+                fn enabled() -> Option<impl Sized> {
+                    Some(()) $(.and($cond))?
+                }
+
                 $(
                     #[test]
                     $(#[$check_meta])*
                     fn $check() {
+                        let Some(_guard) = enabled() else { return };
                         super::$check(&$make);
                     }
                 )*
@@ -303,6 +337,13 @@ mod sanity {
             [allocate, alignment, zero_size, allocate_zeroed, grow, grow_zeroed, grow_align, shrink,
              shrink_align, vec, boxed, grow_not_last, grow_misaligned, shrink_misaligned, dirty_zeroed,
              grow_from_zero, shrink_to_zero, #[cfg_attr(miri, ignore)] too_large]
+
+        // Skipped when the OS has no huge pages reserved, and under Miri which can't map them.
+        #[cfg(all(target_os = "linux", not(miri)))]
+        huge_page => HugePage2MB::default(), if huge_pages();
+            [allocate, alignment, zero_size, allocate_zeroed, grow, grow_zeroed, grow_align, shrink,
+             shrink_align, vec, boxed, grow_not_last, grow_misaligned, shrink_misaligned, dirty_zeroed,
+             grow_from_zero, shrink_to_zero, too_large]
 
         buffer => Buffer::new(&mut [0u8; 2048]);
             [allocate, alignment, zero_size, allocate_zeroed, grow, grow_zeroed, grow_align, shrink,
