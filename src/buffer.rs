@@ -200,3 +200,34 @@ unsafe impl Allocator for Buffer<'_> {
         unsafe { self.resize(ptr, old_layout, new_layout, false) }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single() {
+        let mut buf = [0u8; 64];
+        let buffer = Buffer::new(&mut buf);
+        let layout = Layout::new::<u64>();
+
+        let block = buffer.allocate(layout).unwrap();
+        assert!(buffer.is_used());
+        assert!(buffer.allocate(layout).is_err());
+        // Zero-sized blocks don't need the buffer.
+        assert!(buffer.allocate(Layout::new::<()>()).is_ok());
+
+        unsafe { buffer.deallocate(block.cast(), layout) };
+        assert!(!buffer.is_used());
+        assert!(buffer.allocate(layout).is_ok());
+    }
+
+    #[test]
+    fn full() {
+        let mut buf = [0u8; 16];
+        let buffer = Buffer::new(&mut buf);
+        assert_eq!(buffer.size(), 16);
+        assert!(buffer.allocate(Layout::new::<[u8; 32]>()).is_err());
+        assert!(!buffer.is_used());
+    }
+}

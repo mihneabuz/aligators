@@ -399,3 +399,23 @@ unsafe impl<const SHIFT: u32> Allocator for HugePage<SHIFT> {
         unsafe { Self::MAPPING.resize(ptr, old_layout, new_layout, false) }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rounded() {
+        let layout = Layout::new::<u8>();
+        let block = Page.allocate(layout).unwrap();
+        assert_eq!(block.len(), Page::page_size());
+        assert!(block.addr().get().is_multiple_of(Page::page_size()));
+        unsafe { Page.deallocate(block.cast(), layout) };
+    }
+
+    #[test]
+    fn align_too_big() {
+        let layout = Layout::from_size_align(8, Page::page_size() * 2).unwrap();
+        assert!(Page.allocate(layout).is_err());
+    }
+}

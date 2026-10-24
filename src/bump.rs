@@ -488,7 +488,9 @@ bump! {
 
 #[cfg(test)]
 mod tests {
-    use crate::page::Page;
+    use std::{sync::Barrier, thread};
+
+    use crate::debug::Tracking;
 
     use super::*;
 
@@ -508,26 +510,61 @@ mod tests {
     }
 
     #[test]
-    fn page_backing() {
-        let mut alloc = Bump::with_capacity_in(512, Page);
-        assert_eq!(alloc.remaining_capacity(), Page::page_size());
+    fn full() {
+        let mut buf = [0u8; 64];
+        let bump = Bump::with_buffer(&mut buf);
+        bump.allocate(Layout::new::<[u8; 64]>()).unwrap();
+        assert_eq!(bump.remaining_capacity(), 0);
+        assert!(bump.allocate(Layout::new::<u8>()).is_err());
+    }
 
-        {
-            let box1 = Box::new_in([1_usize; 64], &alloc);
+    #[test]
+    fn rewind() {
+        let mut buf = [0u8; 64];
+        let bump = Bump::with_buffer(&mut buf);
+        let layout = Layout::new::<u64>();
+        let a = bump.allocate(layout).unwrap();
+        let after_a = bump.remaining_capacity();
+        let b = bump.allocate(layout).unwrap();
 
-            let mut vec = Vec::new_in(&alloc);
-            for i in 0..100_usize {
-                vec.push(i * 10);
+        // Only the last block gives memory back.
+        unsafe { bump.deallocate(a.cast(), layout) };
+        assert_eq!(bump.remaining_capacity(), after_a - 8);
+        unsafe { bump.deallocate(b.cast(), layout) };
+        assert_eq!(bump.remaining_capacity(), after_a);
+    }
+
+    #[test]
+    fn no_leak() {
+        let tracking = Tracking::new(Global);
+        let mut bump = Bump::with_capacity_in(64, &tracking);
+        bump.allocate(Layout::new::<u64>()).unwrap();
+        bump.reset();
+        drop(bump);
+        assert!(tracking.finish().is_empty());
+    }
+
+    #[test]
+    fn try_capacity() {
+        assert!(Bump::try_with_capacity_in(16, Leaky::new()).is_err());
+        assert!(Bump::try_with_capacity_in(usize::MAX, Global).is_err());
+    }
+
+    #[test]
+    fn threads() {
+        let bump = AtomicBump::with_capacity(4096);
+        let barrier = Barrier::new(4);
+
+        thread::scope(|scope| {
+            for i in 0..4_u8 {
+                let (bump, barrier) = (&bump, &barrier);
+                scope.spawn(move || {
+                    let block = Box::new_in([i; 64], bump);
+                    // Every thread writes its block before any checks, so overlaps show up.
+                    barrier.wait();
+                    assert_eq!(*block, [i; 64]);
+                });
             }
-
-            let box2 = Box::new_in(7_usize, &alloc);
-
-            vec.extend_from_slice(&box1[..]);
-            *vec.first_mut().unwrap() = *box2;
-        }
-
-        alloc.reset();
-        assert_eq!(alloc.remaining_capacity(), Page::page_size());
-        assert_eq!(alloc.allocated_bytes(), Page::page_size());
+        });
     }
 }

@@ -29,10 +29,18 @@ struct EmptyBlock(BlockHeader);
 unsafe impl Sync for EmptyBlock {}
 
 // Sentinel block for an arena which didn't allocate yet.
-static EMPTY: EmptyBlock = EmptyBlock(BlockHeader {
-    prev: NonNull::from_ref(&EMPTY.0),
+static EMPTY_BLOCK: EmptyBlock = EmptyBlock(BlockHeader {
+    prev: NonNull::from_ref(&EMPTY_BLOCK.0),
     size: HEADER_SIZE,
 });
+
+fn empty_block() -> NonNull<BlockHeader> {
+    NonNull::from_ref(&EMPTY_BLOCK.0)
+}
+
+fn is_empty_block(ptr: NonNull<BlockHeader>) -> bool {
+    ptr::eq(ptr.as_ptr(), &raw const EMPTY_BLOCK.0)
+}
 
 /// Growable bump allocator for a single thread.
 ///
@@ -143,7 +151,7 @@ impl<A: Allocator> Arena<A> {
     #[must_use]
     pub fn new_in(backing: A) -> Self {
         Self {
-            block: Cell::new(NonNull::from_ref(&EMPTY.0)),
+            block: Cell::new(empty_block()),
             cursor: Cell::new(HEADER_SIZE),
             backing,
         }
@@ -199,7 +207,7 @@ impl<A: Allocator> Arena<A> {
         let mut block = self.block.get();
         let mut total = 0;
 
-        while !ptr::eq(block.as_ptr(), &raw const EMPTY.0) {
+        while !is_empty_block(block) {
             // SAFETY: every block other than the empty one is live and starts with a header.
             let header = unsafe { block.as_ref() };
             total += header.size;
@@ -216,16 +224,14 @@ impl<A: Allocator> Arena<A> {
     /// up.
     pub fn reset(&mut self) {
         let mut block = *self.block.get_mut();
-        if ptr::eq(block.as_ptr(), &raw const EMPTY.0) {
+        if is_empty_block(block) {
             return;
         }
 
         // SAFETY: `block` is live, since it isn't the empty one, and `&mut self` means no other
         // reference to its header exists.
-        let prev = mem::replace(
-            unsafe { &mut block.as_mut().prev },
-            NonNull::from_ref(&EMPTY.0),
-        );
+        let prev = mem::replace(unsafe { &mut block.as_mut().prev }, empty_block());
+
         // SAFETY: `&mut self` means no allocation is still in use, and the current block no
         // longer links to the freed ones.
         unsafe { self.free_blocks(prev) };
@@ -311,7 +317,7 @@ impl<A: Allocator> Arena<A> {
     // `block` must be the empty block or a live block of this arena, and no allocation from the
     // freed blocks may be used afterwards.
     unsafe fn free_blocks(&self, mut block: NonNull<BlockHeader>) {
-        while !ptr::eq(block.as_ptr(), &raw const EMPTY.0) {
+        while !is_empty_block(block) {
             // SAFETY: every block other than the empty one is live and starts with a header.
             let BlockHeader { prev, size } = unsafe { block.read() };
 
@@ -448,6 +454,8 @@ impl<A: Allocator> Drop for Arena<A> {
 
 #[cfg(test)]
 mod tests {
+    use crate::{Leaky, debug::Tracking};
+
     use super::*;
 
     #[test]
@@ -468,14 +476,18 @@ mod tests {
 
         // Only the newest block is kept, emptied.
         assert_eq!(arena.block.get(), newest);
-        assert!(ptr::eq(
-            unsafe { newest.as_ref() }.prev.as_ptr(),
-            &raw const EMPTY.0
-        ));
+        assert!(is_empty_block(unsafe { newest.as_ref() }.prev));
         assert_eq!(arena.cursor.get(), HEADER_SIZE);
 
         let boxed = Box::new_in(42_usize, &arena);
         assert_eq!(*boxed, 42);
+    }
+
+    #[test]
+    fn reset_empty() {
+        let mut arena = Arena::new();
+        arena.reset();
+        assert!(is_empty_block(arena.block.get()));
     }
 
     #[test]
@@ -500,9 +512,59 @@ mod tests {
     }
 
     #[test]
-    fn reset_empty() {
-        let mut arena = Arena::new();
-        arena.reset();
-        assert!(ptr::eq(arena.block.get().as_ptr(), &raw const EMPTY.0));
+    fn growth() {
+        let arena = Arena::new();
+        arena.allocate(Layout::new::<u8>()).unwrap();
+        let first = arena.allocated_bytes();
+        assert!(first >= HEADER_SIZE + DEFAULT_INITIAL_CAPACITY);
+
+        // Overflowing the first block adds one four times as big.
+        let rest = Layout::from_size_align(arena.remaining_capacity() + 1, 1).unwrap();
+        arena.allocate(rest).unwrap();
+        assert!(arena.allocated_bytes() >= first + 4 * (first - HEADER_SIZE));
+    }
+
+    #[test]
+    fn huge() {
+        let arena = Arena::new();
+        let layout = Layout::new::<[u8; 1 << 20]>();
+        arena.allocate(layout).unwrap();
+        assert!(arena.allocated_bytes() >= HEADER_SIZE + layout.size());
+    }
+
+    #[test]
+    fn stable() {
+        let arena = Arena::with_capacity(16);
+        let first = Box::new_in(7_u64, &arena);
+        let addr = &raw const *first;
+        let _many = (0..1000_u64)
+            .map(|i| Box::new_in(i, &arena))
+            .collect::<Vec<_>>();
+        assert_eq!(&raw const *first, addr);
+        assert_eq!(*first, 7);
+    }
+
+    #[test]
+    fn no_leak() {
+        let tracking = Tracking::new(Global);
+        let mut arena = Arena::with_capacity_in(16, &tracking);
+        for _ in 0..3 {
+            let mut vec = Vec::new_in(&arena);
+            vec.extend(0..1000_u64);
+            drop(vec);
+            arena.reset();
+        }
+        drop(arena);
+        assert!(tracking.finish().is_empty());
+    }
+
+    #[test]
+    fn try_capacity() {
+        assert!(Arena::try_with_capacity_in(16, Leaky::new()).is_err());
+        assert!(Arena::try_with_capacity_in(usize::MAX, Global).is_err());
+
+        // Lazy, so only the first allocation fails.
+        let arena = Arena::new_in(Leaky::new());
+        assert!(arena.allocate(Layout::new::<u8>()).is_err());
     }
 }
