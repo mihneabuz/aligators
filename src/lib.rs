@@ -1,9 +1,11 @@
+mod arena;
 mod buffer;
 mod bump;
 mod utils;
 
+pub use arena::Arena;
 pub use buffer::Buffer;
-pub use bump::{Bump, AtomicBump};
+pub use bump::{AtomicBump, Bump};
 pub use utils::Leaky;
 
 pub mod debug;

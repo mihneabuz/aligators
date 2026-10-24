@@ -3,7 +3,7 @@ use std::{
     ptr::NonNull,
 };
 
-use aligators::{AtomicBump, Buffer, Bump};
+use aligators::{Arena, AtomicBump, Buffer, Bump};
 
 #[cfg(target_os = "linux")]
 use aligators::page::Page;
@@ -323,5 +323,22 @@ mod sanity {
             [allocate, alignment, zero_size, allocate_zeroed, grow, grow_zeroed, grow_align, shrink,
              shrink_align, vec, boxed, grow_not_last, grow_misaligned, shrink_misaligned, dirty_zeroed,
              too_large, grow_from_zero, shrink_to_zero]
+
+        arena => Arena::new();
+            [allocate, alignment, zero_size, allocate_zeroed, grow, grow_zeroed, grow_align, shrink,
+             shrink_align, vec, boxed, grow_not_last, grow_misaligned, shrink_misaligned, dirty_zeroed,
+             #[cfg_attr(miri, ignore)] too_large, grow_from_zero, shrink_to_zero]
+
+        // Starts with a tiny block, so most checks spill into new blocks.
+        arena_small => Arena::with_capacity(16);
+            [allocate, alignment, zero_size, allocate_zeroed, grow, grow_zeroed, grow_align, shrink,
+             shrink_align, vec, boxed, grow_not_last, grow_misaligned, shrink_misaligned, dirty_zeroed,
+             #[cfg_attr(miri, ignore)] too_large, grow_from_zero, shrink_to_zero]
+
+        #[cfg(target_os = "linux")]
+        arena_on_page => Arena::new_in(Page);
+            [allocate, alignment, zero_size, allocate_zeroed, grow, grow_zeroed, grow_align, shrink,
+             shrink_align, vec, boxed, grow_not_last, grow_misaligned, shrink_misaligned, dirty_zeroed,
+             #[cfg_attr(miri, ignore)] too_large, grow_from_zero, shrink_to_zero]
     }
 }

@@ -129,10 +129,15 @@ impl<C: Cursor, A: Allocator> BumpInner<C, A> {
         self.base.len() - self.cursor.get()
     }
 
+    fn allocated_bytes(&self) -> usize {
+        self.base.len()
+    }
+
     fn reset(&mut self) {
         self.cursor.reset();
     }
 
+    #[inline]
     fn try_fit_new(&self, layout: Layout) -> Option<NonNull<[u8]>> {
         let (base, size) = (self.base.cast::<u8>(), self.base.len());
         let mut offset = 0;
@@ -169,6 +174,16 @@ impl<C: Cursor, A: Allocator> BumpInner<C, A> {
             .is_some()
     }
 
+    // Tries to resize `ptr` in place, if it is the last block and aligned for `new_layout`.
+    fn try_resize_last(&self, ptr: NonNull<u8>, old_layout: Layout, new_layout: Layout) -> bool {
+        is_aligned(ptr, new_layout.align())
+            && self.try_update_last(ptr, old_layout, |cursor| {
+                let end = (cursor - old_layout.size()).checked_add(new_layout.size())?;
+                (end <= self.base.len()).then_some(end)
+            })
+    }
+
+    #[inline]
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         self.try_fit_new(layout).ok_or(AllocError)
     }
@@ -190,13 +205,8 @@ impl<C: Cursor, A: Allocator> BumpInner<C, A> {
         new_layout: Layout,
     ) -> Result<NonNull<[u8]>, AllocError> {
         let (new_size, old_size) = (new_layout.size(), old_layout.size());
-        let diff = new_size - old_size;
 
-        if is_aligned(ptr, new_layout.align())
-            && self.try_update_last(ptr, old_layout, |cursor| {
-                (cursor + diff <= self.base.len()).then_some(cursor + diff)
-            })
-        {
+        if self.try_resize_last(ptr, old_layout, new_layout) {
             return Ok(NonNull::slice_from_raw_parts(ptr, new_size));
         }
 
@@ -218,11 +228,7 @@ impl<C: Cursor, A: Allocator> BumpInner<C, A> {
         let (new_size, old_size) = (new_layout.size(), old_layout.size());
         let diff = new_size - old_size;
 
-        if is_aligned(ptr, new_layout.align())
-            && self.try_update_last(ptr, old_layout, |cursor| {
-                (cursor + diff <= self.base.len()).then_some(cursor + diff)
-            })
-        {
+        if self.try_resize_last(ptr, old_layout, new_layout) {
             // SAFETY: the cursor was just moved past `ptr + new.size`, so `old_size..new_size`
             // lies inside `base` and belongs to this block.
             unsafe {
@@ -252,13 +258,12 @@ impl<C: Cursor, A: Allocator> BumpInner<C, A> {
         new_layout: Layout,
     ) -> Result<NonNull<[u8]>, AllocError> {
         let (new_size, old_size) = (new_layout.size(), old_layout.size());
-        let diff = old_size - new_size;
+
+        if self.try_resize_last(ptr, old_layout, new_layout) {
+            return Ok(NonNull::slice_from_raw_parts(ptr, new_size));
+        }
 
         if is_aligned(ptr, new_layout.align()) {
-            if self.try_update_last(ptr, old_layout, |cursor| Some(cursor - diff)) {
-                return Ok(NonNull::slice_from_raw_parts(ptr, new_size));
-            }
-
             return Ok(NonNull::slice_from_raw_parts(ptr, old_size));
         }
 
@@ -332,6 +337,14 @@ macro_rules! bump {
                 self.0.remaining_capacity()
             }
 
+            /// Returns the size of the buffer in bytes, whether it is borrowed or allocated from
+            /// `backing`.
+            ///
+            /// The buffer never grows, so this doesn't change over the allocator's lifetime.
+            pub fn allocated_bytes(&self) -> usize {
+                self.0.allocated_bytes()
+            }
+
             /// Frees every allocation at once.
             pub fn reset(&mut self) {
                 self.0.reset();
@@ -342,6 +355,7 @@ macro_rules! bump {
         // They stay valid until `reset` (needs `&mut self`) or drop, and moving the allocator
         // doesn't move `base`.
         unsafe impl<A: Allocator> Allocator for $name<A> {
+            #[inline]
             fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
                 self.0.allocate(layout)
             }
@@ -514,5 +528,6 @@ mod tests {
 
         alloc.reset();
         assert_eq!(alloc.remaining_capacity(), Page::page_size());
+        assert_eq!(alloc.allocated_bytes(), Page::page_size());
     }
 }

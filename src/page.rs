@@ -226,8 +226,8 @@ impl Mapping {
 /// and deallocations go through `munmap`.
 ///
 /// All allocations will be multiples of [`Page::page_size()`], which can be quite large for most
-/// uses, so it is recommended to combine it with a [`Bump`] or [`Arena`] when doing many smaller
-/// allocations.
+/// uses, so it is recommended to combine it with a [`Bump`](crate::Bump) or [`Arena`](crate::Arena)
+/// when doing many smaller allocations.
 ///
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Page;
