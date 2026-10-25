@@ -3,16 +3,19 @@ use std::{
     ptr::NonNull,
 };
 
+use aligators::{Arena, AtomicBump, Buffer, Bump, Slab};
+
 #[cfg(target_os = "linux")]
+use aligators::page::Page;
+
+#[cfg(all(target_os = "linux", not(miri)))]
+use aligators::page::HugePage2MB;
+
+#[cfg(all(target_os = "linux", not(miri)))]
 use std::{
     fs,
     sync::{Mutex, MutexGuard, PoisonError},
 };
-
-use aligators::{Arena, AtomicBump, Buffer, Bump};
-
-#[cfg(target_os = "linux")]
-use aligators::page::{HugePage2MB, Page};
 
 fn layout(size: usize, align: usize) -> Layout {
     Layout::from_size_align(size, align).unwrap()
@@ -283,7 +286,7 @@ fn boxed(alloc: &dyn Allocator) {
 
 /// Huge pages only work when the OS has some reserved, and each check holds a few at once. Checks
 /// take a lock so they run one at a time, and are skipped unless enough pages are free.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(miri)))]
 fn huge_pages() -> Option<MutexGuard<'static, ()>> {
     static LOCK: Mutex<()> = Mutex::new(());
     let guard = LOCK.lock().unwrap_or_else(PoisonError::into_inner);
@@ -370,7 +373,6 @@ mod sanity {
              shrink_align, vec, boxed, grow_not_last, grow_misaligned, shrink_misaligned, dirty_zeroed,
              #[cfg_attr(miri, ignore)] too_large, grow_from_zero, shrink_to_zero]
 
-        // Starts with a tiny block, so most checks spill into new blocks.
         arena_small => Arena::with_capacity(16);
             [allocate, alignment, zero_size, allocate_zeroed, grow, grow_zeroed, grow_align, shrink,
              shrink_align, vec, boxed, grow_not_last, grow_misaligned, shrink_misaligned, dirty_zeroed,
@@ -381,5 +383,21 @@ mod sanity {
             [allocate, alignment, zero_size, allocate_zeroed, grow, grow_zeroed, grow_align, shrink,
              shrink_align, vec, boxed, grow_not_last, grow_misaligned, shrink_misaligned, dirty_zeroed,
              #[cfg_attr(miri, ignore)] too_large, grow_from_zero, shrink_to_zero]
+
+        slab => Slab::with_capacity(layout(512, 128), 4);
+            [allocate, alignment, zero_size, allocate_zeroed, grow, grow_zeroed, grow_align, shrink,
+             shrink_align, vec, boxed, grow_not_last, grow_misaligned, shrink_misaligned, dirty_zeroed,
+             too_large, grow_from_zero, shrink_to_zero]
+
+        slab_small => Slab::with_capacity(layout(512, 128), 1);
+            [allocate, alignment, zero_size, allocate_zeroed, grow, grow_zeroed, grow_align, shrink,
+             shrink_align, vec, boxed, grow_not_last, grow_misaligned, shrink_misaligned, dirty_zeroed,
+             too_large, grow_from_zero, shrink_to_zero]
+
+        #[cfg(target_os = "linux")]
+        slab_on_page => Slab::with_capacity_in(layout(512, 128), 4, Page);
+            [allocate, alignment, zero_size, allocate_zeroed, grow, grow_zeroed, grow_align, shrink,
+             shrink_align, vec, boxed, grow_not_last, grow_misaligned, shrink_misaligned, dirty_zeroed,
+             too_large, grow_from_zero, shrink_to_zero]
     }
 }

@@ -182,11 +182,9 @@ impl<A: Allocator> Arena<A> {
     /// Returns [`AllocError`] if `backing` fails.
     pub fn try_with_capacity_in(capacity: usize, backing: A) -> Result<Self, AllocError> {
         let arena = Self::new_in(backing);
-        if capacity == 0 {
-            return Ok(arena);
+        if capacity > 0 {
+            arena.new_block(capacity)?;
         }
-
-        arena.new_block(capacity)?;
         Ok(arena)
     }
 
